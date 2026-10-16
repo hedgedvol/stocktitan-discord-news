@@ -26,6 +26,13 @@ INSIDER_MAX_FETCH = int(env("INSIDER_MAX_FETCH", "5"))  # XML fetches per cycle
 HALTS = env("HALTS", "1") == "1"
 HALTS_URL = env("HALTS_URL", "https://www.nasdaqtrader.com/rss.aspx?feed=tradehalts")
 RECAP = env("RECAP", "1") == "1"
+LIVE_POLL = float(env("LIVE_POLL", "20"))        # live.html base interval (s)
+LIVE_POLL_WS = float(env("LIVE_POLL_WS", "60"))  # ... while the websocket is delivering
+RSS_POLL = float(env("RSS_POLL", "30"))          # StockTitan RSS base interval (s)
+WIRE_POLL = float(env("WIRE_POLL", "15"))        # per-wire base interval (s)
+ST_MIN_GAP = float(env("ST_MIN_GAP", "5"))       # min seconds between any two stocktitan.net requests
+NEWS_TIMEOUT = float(env("NEWS_TIMEOUT", "5"))   # per-request timeout for news sources
+WIRE_DEFAULTS = {"WIRE_GNW": "0"}
 WIRES = env("WIRES", "1") == "1"
 WIRE_FEEDS = {  # name -> (toggle env, url)
     "PR Newswire": ("WIRE_PRN", "https://www.prnewswire.com/rss/news-releases-list.rss"),
@@ -128,7 +135,7 @@ def get_quote(ticker):
         for host in ("query1", "query2"):
             r = requests.get(f"https://{host}.finance.yahoo.com/v8/finance/chart/{ticker.replace('.', '-')}",
                              params={"interval": "5m", "range": "1d", "includePrePost": "true"},
-                             headers={"User-Agent": UA_BROWSER}, timeout=8)
+                             headers={"User-Agent": UA_BROWSER}, timeout=5)
             if r.status_code == 200:
                 break
         res = r.json()["chart"]["result"][0]
@@ -188,10 +195,10 @@ def yahoo_session(refresh=False):
         s = requests.Session()
         s.headers["User-Agent"] = UA_BROWSER
         try:
-            s.get("https://fc.yahoo.com", timeout=8)  # 404 is normal; it sets the A3 cookie
+            s.get("https://fc.yahoo.com", timeout=5)  # 404 is normal; it sets the A3 cookie
         except Exception:
             pass
-        r = s.get("https://query2.finance.yahoo.com/v1/test/getcrumb", timeout=8)
+        r = s.get("https://query2.finance.yahoo.com/v1/test/getcrumb", timeout=5)
         crumb = r.text.strip() if r.status_code == 200 and len(r.text) < 40 and "<" not in r.text else None
         _yh.update(s=s, crumb=crumb, t=time.time())
     return _yh["s"], _yh["crumb"]
@@ -200,7 +207,7 @@ def yahoo_json(url, params):
     for attempt in (0, 1):
         s, crumb = yahoo_session(refresh=attempt == 1)
         p = dict(params, **({"crumb": crumb} if crumb else {}))
-        r = s.get(url, params=p, timeout=8)
+        r = s.get(url, params=p, timeout=5)
         if r.status_code in (401, 403) and attempt == 0:
             continue
         r.raise_for_status()
@@ -267,7 +274,7 @@ def chart_url(ticker, q):
             cfg["data"]["datasets"].append({"data": [q["prev"]] * len(data), "borderColor": "rgba(150,150,150,0.8)",
                                             "borderDash": [4, 4], "borderWidth": 1, "pointRadius": 0, "fill": False})
         r = requests.post("https://quickchart.io/chart/create",
-                          json={"chart": cfg, "width": 500, "height": 250, "backgroundColor": "white"}, timeout=6)
+                          json={"chart": cfg, "width": 500, "height": 250, "backgroundColor": "white"}, timeout=5)
         if r.status_code == 200 and r.json().get("success"):
             url = r.json()["url"]
     except Exception as ex:
@@ -326,6 +333,133 @@ _social = {"top": {}, "t": 0}
 def social_tag(ticker):
     r = _social["top"].get(ticker)
     return f"🗣️ Trending on Reddit (#{r})" if r else None
+
+
+# ---------- polite fetching: backoff, conditional GET, shared sessions ----------
+BROWSER_HEADERS = {
+    "User-Agent": UA_BROWSER,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,application/rss+xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate",
+    "Cache-Control": "no-cache",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+}
+
+class Backoff:
+    """Per-source schedule: base interval, Retry-After / exponential backoff, slow recovery."""
+    def __init__(self, name, base, min_fail=30, cap=300):
+        self.name, self.base, self.min_fail, self.cap = name, base, min_fail, cap
+        self.interval, self.next_at, self.fails, self.last_err = base, 0.0, 0, None
+
+    def ready(self, now=None, base=None):
+        if base is not None and base != self.base:
+            self.interval = max(self.interval, base) if self.fails else base
+            self.base = base
+        return (now or time.time()) >= self.next_at
+
+    def ok(self, now=None):
+        now = now or time.time()
+        self.fails, self.last_err = 0, None
+        self.interval = max(self.base, self.interval / 2)  # step back toward base gradually
+        self.next_at = now + self.interval
+
+    def fail(self, err, retry_after=None, now=None):
+        now = now or time.time()
+        self.fails += 1
+        self.last_err = str(err)[:120]
+        if retry_after is not None:
+            self.interval = min(self.cap, max(self.base, retry_after))
+        else:
+            self.interval = min(self.cap, max(self.min_fail, self.interval * 2))
+        self.next_at = now + self.interval
+
+    def status(self):
+        return f"{self.name} backoff {self.interval:.0f}s ({self.last_err})" if self.fails else None
+
+def parse_retry_after(v):
+    if not v:
+        return None
+    try:
+        return float(v)
+    except ValueError:
+        try:
+            from email.utils import parsedate_to_datetime
+            return max(0.0, (parsedate_to_datetime(v) - datetime.now(timezone.utc)).total_seconds())
+        except Exception:
+            return None
+
+class RateLimited(Exception):
+    def __init__(self, code, retry_after):
+        super().__init__(f"HTTP {code}" + (f" retry-after {retry_after:.0f}s" if retry_after else ""))
+        self.retry_after = retry_after
+
+_sessions = {}
+_cond = {}            # url -> {"etag":..., "lm":...}
+_host_last = {}       # host -> last request time (politeness gap)
+_host_block = {}      # host -> blocked-until (shared 429 backoff)
+
+def session_for(host):
+    s = _sessions.get(host)
+    if s is None:
+        s = _sessions[host] = requests.Session()
+        s.headers.update(BROWSER_HEADERS)
+    return s
+
+def polite_get(url, timeout=None, min_gap=0.0):
+    """GET with keep-alive session, ETag/If-Modified-Since, host gap and shared 429 block.
+    Returns Response, or None for 304 Not Modified. Raises RateLimited on 429/503."""
+    host = re.sub(r"^https?://([^/]+).*$", r"\1", url)
+    now = time.time()
+    if _host_block.get(host, 0) > now:
+        raise RateLimited("429 (host cooling down)", _host_block[host] - now)
+    if min_gap and now - _host_last.get(host, 0) < min_gap:
+        raise _Skip()
+    _host_last[host] = now
+    h = {}
+    c = _cond.get(url) or {}
+    if c.get("etag"): h["If-None-Match"] = c["etag"]
+    if c.get("lm"): h["If-Modified-Since"] = c["lm"]
+    r = session_for(host).get(url, headers=h, timeout=timeout or NEWS_TIMEOUT)
+    if r.status_code in (429, 503):
+        ra = parse_retry_after(r.headers.get("Retry-After"))
+        if host.endswith("stocktitan.net"):
+            _host_block[host] = time.time() + (ra if ra is not None else 30)
+        raise RateLimited(r.status_code, ra)
+    if r.status_code == 304:
+        return None
+    r.raise_for_status()
+    _cond[url] = {"etag": r.headers.get("ETag"), "lm": r.headers.get("Last-Modified")}
+    if len(_cond) > 50:
+        _cond.pop(next(iter(_cond)))
+    return r
+
+class _Skip(Exception):
+    """Not an error: politeness gap not yet elapsed; try again next tick."""
+
+def run_sched(bk, fn, base=None):
+    """Run fn() if its Backoff says so; translate errors into backoff. Returns log text or None."""
+    if not bk.ready(base=base):
+        return None
+    try:
+        res = fn()
+        bk.ok()
+        return res
+    except _Skip:
+        return None
+    except RateLimited as ex:
+        bk.fail(ex, ex.retry_after)
+        return f"{bk.name} rate-limited: {ex} -> next in {bk.interval:.0f}s"
+    except requests.Timeout as ex:
+        bk.fail("timeout")
+        return f"{bk.name} timeout -> next in {bk.interval:.0f}s"
+    except requests.HTTPError as ex:
+        code = ex.response.status_code if ex.response is not None else "?"
+        bk.fail(f"HTTP {code}")
+        return f"{bk.name} HTTP {code} -> next in {bk.interval:.0f}s"
+    except Exception as ex:
+        bk.fail(ex)
+        return f"{bk.name} error: {str(ex)[:100]} -> next in {bk.interval:.0f}s"
 
 # ---------- StockTitan ----------
 TITLE_RX = re.compile(r"^(?P<head>.*?)\s*\|\s*(?P<tick>[A-Z0-9.\-]{1,12})\s+Stock News\s*$")
@@ -465,7 +599,7 @@ def handle_news(p, source, summary=""):
 # ---------- SEC helpers ----------
 _sec_last_req = 0.0
 
-def sec_get(url, timeout=20):
+def sec_get(url, timeout=10):
     """All sec.gov requests go through here: compliant UA, ≤1 request/sec overall."""
     global _sec_last_req
     wait = 1.0 - (time.time() - _sec_last_req)
@@ -580,7 +714,9 @@ def post(embed, kind="news", content=None, role_id=None):
 # ---------- sources ----------
 def poll_stocktitan():
     seed = needs_seed("stocktitan")
-    r = requests.get(FEED, headers={"User-Agent": UA_BROWSER}, timeout=15)
+    r = polite_get(FEED, min_gap=ST_MIN_GAP)
+    if r is None:
+        return None  # 304 not modified
     feed = feedparser.parse(r.content)
     posted = 0
     for e in reversed(feed.entries):
@@ -636,8 +772,9 @@ def parse_live_item(x):
 
 def poll_stocktitan_live():
     seed = needs_seed("stocktitan_live")
-    r = requests.get(LIVE_URL, headers={"User-Agent": UA_BROWSER, "Accept-Encoding": "gzip, deflate"}, timeout=10)
-    r.raise_for_status()
+    r = polite_get(LIVE_URL, min_gap=ST_MIN_GAP)
+    if r is None:
+        return None  # 304 not modified
     m = JSG_RX.search(r.text)
     if not m:
         raise ValueError("jsGlobals not found (page layout changed?)")
@@ -661,40 +798,80 @@ def poll_stocktitan_live():
 # ---------- StockTitan websocket (experimental, default off) ----------
 import queue, threading
 _ws_q = queue.Queue(maxsize=500)
-_ws_status = {"state": "off", "msgs": 0, "news": 0, "err": None}
+_ws_status = {"state": "off", "msgs": 0, "news": 0, "err": None, "raw": [], "last_type": None}
 
 def _ws_thread():
+    st = _ws_status
     try:
         import websocket  # websocket-client
-    except ImportError:
-        _ws_status.update(state="no websocket-client"); return
+    except ImportError as ex:
+        st.update(state="error", err=f"ImportError: {ex}"); return
     delay = 5
     while True:
-        url = _live_meta.get("ws") or env("STOCKTITAN_WS_URL")
+        url = env("STOCKTITAN_WS_URL") or _live_meta.get("ws")
         if not url:
-            time.sleep(5); continue
+            st.update(state="waiting for ws url"); time.sleep(5); continue
+        ws = None
         try:
-            _ws_status["state"] = "connecting"
+            st.update(state="connecting", url=url, attempts=st.get("attempts", 0) + 1)
             ws = websocket.create_connection(url, timeout=15, origin="https://www.stocktitan.net",
                                              header=[f"User-Agent: {UA_BROWSER}"])
-            _ws_status["state"] = "open"; delay = 5
-            ws.settimeout(90)
+            st.update(state="connected", since=time.time(), err=None)
+            ws.settimeout(120)
             while True:
-                raw = ws.recv()
-                _ws_status["msgs"] += 1
-                d = json.loads(raw)
+                op, frame = ws.recv_data_frame(True)
+                if op == websocket.ABNF.OPCODE_CLOSE:
+                    data = frame.data or b""
+                    code = int.from_bytes(data[:2], "big") if len(data) >= 2 else None
+                    reason = data[2:].decode("utf-8", "replace")[:120]
+                    st.update(state="closed", err=f"close code={code} reason={reason!r}")
+                    break
+                if op not in (websocket.ABNF.OPCODE_TEXT, websocket.ABNF.OPCODE_BINARY):
+                    continue
+                raw = frame.data.decode("utf-8", "replace") if isinstance(frame.data, bytes) else str(frame.data)
+                st["msgs"] += 1
+                st["last_at"] = time.time()
+                if len(st["raw"]) < 2:
+                    st["raw"].append(raw[:300])
+                    print(f"ws raw message #{len(st['raw'])}: {raw[:300]}", flush=True)
+                try:
+                    d = json.loads(raw)
+                except ValueError:
+                    st["last_type"] = "non-json"; continue
                 h = d.get("header") or {}
-                if h.get("type") == "ping":
+                st["last_type"] = h.get("type") or d.get("type") or "?"
+                if st["last_type"] == "ping":
                     ws.send(json.dumps({"type": "pong"}))
-                elif h.get("type") == "news":
-                    _ws_status["news"] += 1
+                elif st["last_type"] == "news":
+                    st["news"] += 1
                     pl = d.get("payload")
                     for it in (pl if isinstance(pl, list) else [pl]):
                         try: _ws_q.put_nowait(it)
                         except queue.Full: pass
+            delay = 5 if time.time() - st.get("since", 0) > 60 else min(delay * 2, 300)
         except Exception as ex:
-            _ws_status.update(state="reconnecting", err=str(ex)[:100])
-            time.sleep(delay); delay = min(delay * 2, 300)
+            st.update(state="error", err=f"{type(ex).__name__}: {str(ex)[:160]}")
+            delay = min(delay * 2, 300)
+        finally:
+            try:
+                if ws: ws.close()
+            except Exception:
+                pass
+        st["retry_in"] = delay
+        time.sleep(delay)
+
+def ws_delivering():
+    st = _ws_status
+    return st.get("state") == "connected" and st.get("news", 0) > 0 and time.time() - st.get("last_at", 0) < 300
+
+def ws_status_line():
+    st = _ws_status
+    parts = [f"ws {st.get('state')}", f"msgs={st.get('msgs', 0)}", f"news={st.get('news', 0)}"]
+    if st.get("last_type"): parts.append(f"last={st['last_type']}")
+    if st.get("last_at"): parts.append(f"{time.time() - st['last_at']:.0f}s ago")
+    if st.get("state") != "connected" and st.get("err"): parts.append(f"err={st['err']}")
+    if st.get("state") in ("error", "closed") and st.get("retry_in"): parts.append(f"retry {st['retry_in']}s")
+    return " ".join(parts)
 
 def start_ws():
     if STOCKTITAN_WS and _ws_status["state"] == "off":
@@ -717,7 +894,7 @@ def drain_ws():
         if fs and fs.get("float"):
             state.setdefault("fs", {})[p["ticker"]] = fs
         posted += handle_news(p, "StockTitan")
-    return f"ws {_ws_status['state']} q={n} posted={posted}" if (n or _ws_status["state"] != "open") else None
+    return ws_status_line() + (f" q={n} posted={posted}" if n else "")
 
 # ---------- newsfilter.io (optional, needs NEWSFILTER_API_KEY) ----------
 NEWSFILTER_API_KEY = env("NEWSFILTER_API_KEY")
@@ -727,7 +904,7 @@ def poll_newsfilter():
     seed = needs_seed("newsfilter")
     r = requests.post("https://api.newsfilter.io/search", headers={"Authorization": NEWSFILTER_API_KEY},
                       json={"queryString": "symbols:* AND publishedAt:[now-1h TO *]", "from": 0, "size": 50},
-                      timeout=10)
+                      timeout=5)
     r.raise_for_status()
     arts = r.json().get("articles") or []
     posted = 0
@@ -771,38 +948,43 @@ def parse_wire(e, wire):
             "color": color, "timestamp": dt.isoformat() if dt else None,
             "session": session_tag(dt) if dt else None, "logo": None}, summary
 
+_wire_bk = {}
+
+def _poll_one_wire(wire, url):
+    src = f"wire:{wire}"
+    r = polite_get(url)
+    if r is None:
+        return None
+    feed = feedparser.parse(r.content)
+    seed = needs_seed(src)
+    posted = 0
+    for e in reversed(feed.entries):
+        link = e.get("link") or ""
+        eid = "w:" + (e.get("id") or link)
+        if eid in seen_set:
+            continue
+        mark(eid)
+        if wire == "Business Wire" and "/en/" not in link:  # skip translated duplicates
+            continue
+        p, summary = parse_wire(e, wire)
+        if not p["ticker"]:
+            continue  # post only items with an exchange ticker
+        if seed:
+            remember_story(p["ticker"], tokens(p["headline"]), wire, p["timestamp"]); continue
+        posted += handle_news(p, wire, summary)
+    done_seed(src)
+    return f"{wire} posted={posted}" + (" (seeded)" if seed else "") if (posted or seed) else None
+
 def poll_wires():
     out = []
     for wire, (toggle, url) in WIRE_FEEDS.items():
-        if not url or env(toggle, "1") != "1":
+        if not url or env(toggle, WIRE_DEFAULTS.get(toggle, "1")) != "1":
             continue
-        src = f"wire:{wire}"
-        try:
-            r = requests.get(url, headers={"User-Agent": UA_BROWSER}, timeout=8)
-            if r.status_code != 200:
-                out.append(f"{wire} HTTP {r.status_code}"); continue
-            feed = feedparser.parse(r.content)
-            seed = needs_seed(src)
-            posted = 0
-            for e in reversed(feed.entries):
-                link = e.get("link") or ""
-                eid = "w:" + (e.get("id") or link)
-                if eid in seen_set:
-                    continue
-                mark(eid)
-                if wire == "Business Wire" and "/en/" not in link:  # skip translated duplicates
-                    continue
-                p, summary = parse_wire(e, wire)
-                if not p["ticker"]:
-                    continue  # post only items with an exchange ticker
-                if seed:
-                    remember_story(p["ticker"], tokens(p["headline"]), wire, p["timestamp"]); continue
-                posted += handle_news(p, wire, summary)
-            done_seed(src)
-            out.append(f"{wire} n={len(feed.entries)} posted={posted}" + (" (seeded)" if seed else ""))
-        except Exception as ex:
-            out.append(f"{wire} error: {str(ex)[:80]}")
-    return " ".join(out) or None
+        bk = _wire_bk.setdefault(wire, Backoff(wire, WIRE_POLL, min_fail=30, cap=600))
+        res = run_sched(bk, lambda w=wire, u=url: _poll_one_wire(w, u))
+        if res and (bk.fails <= 1 or bk.fails % 10 == 0 or "posted" in res):
+            out.append(res)  # quiet: log first failure, then every 10th
+    return " | ".join(out) or None
 
 _form_last = {}
 
@@ -969,7 +1151,7 @@ def build_halt_embed(h, resumed):
 
 def poll_halts():
     src = "halts"
-    r = requests.get(HALTS_URL, headers={"User-Agent": UA_BROWSER}, timeout=20)
+    r = requests.get(HALTS_URL, headers={"User-Agent": UA_BROWSER}, timeout=5)
     r.raise_for_status()
     feed = feedparser.parse(r.content)
     seed = needs_seed(src)
@@ -1061,7 +1243,7 @@ def maybe_earnings_cal(force=False):
     if state.get("ecal_posted") == d:
         return None
     r = requests.get("https://api.nasdaq.com/api/calendar/earnings", params={"date": d},
-                     headers={"User-Agent": UA_BROWSER, "Accept": "application/json"}, timeout=15)
+                     headers={"User-Agent": UA_BROWSER, "Accept": "application/json"}, timeout=8)
     r.raise_for_status()
     rows = ((r.json().get("data") or {}).get("rows")) or []
     if TICKERS:
@@ -1142,7 +1324,7 @@ def poll_volume():
 
 # ---------- social buzz (ApeWisdom) ----------
 def poll_social():
-    r = requests.get("https://apewisdom.io/api/v1.0/filter/all-stocks", headers={"User-Agent": UA_BROWSER}, timeout=10)
+    r = requests.get("https://apewisdom.io/api/v1.0/filter/all-stocks", headers={"User-Agent": UA_BROWSER}, timeout=5)
     r.raise_for_status()
     res = r.json().get("results") or []
     _social["top"] = {x["ticker"].upper(): x["rank"] for x in res if x.get("rank", 999) <= 20}
@@ -1179,6 +1361,8 @@ def poll_social():
 
 # ---------- loop / scheduler ----------
 _last_run = {}
+_bk_live = Backoff("live", LIVE_POLL)
+_bk_rss = Backoff("rss", RSS_POLL)
 
 def due(name, every):
     if time.time() - _last_run.get(name, 0) >= every:
@@ -1191,8 +1375,10 @@ def poll_once():
     jobs = []
     if SOCIAL and due("social", 600): jobs.append(("social", poll_social))  # first so top-20 tags are ready
     if STOCKTITAN_WS: start_ws(); jobs.append(("ws", drain_ws))  # fastest: pushed items
-    if STOCKTITAN_LIVE: jobs.append(("stocktitan_live", poll_stocktitan_live))
-    jobs.append(("stocktitan", poll_stocktitan))
+    if STOCKTITAN_LIVE:
+        base = LIVE_POLL_WS if (STOCKTITAN_WS and ws_delivering()) else LIVE_POLL
+        jobs.append(("stocktitan_live", lambda b=base: run_sched(_bk_live, poll_stocktitan_live, base=b)))
+    jobs.append(("stocktitan", lambda: run_sched(_bk_rss, poll_stocktitan)))
     if WIRES: jobs.append(("wires", poll_wires))
     if NEWSFILTER_API_KEY and due("newsfilter", NEWSFILTER_POLL): jobs.append(("newsfilter", poll_newsfilter))
     jobs += [(f"sec {f}", (lambda f=f: poll_sec(f))) for f in SEC_FORMS]  # self-throttled 60 s/form

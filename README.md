@@ -73,7 +73,7 @@ without posting, so the channel is not flooded.
   later. The old list-format `seen.json` is migrated automatically.
 
 ## v3 features (speed first)
-Main loop polls every `POLL_SECONDS` (default 10). Only the fast news sources run every tick;
+Main loop ticks every `POLL_SECONDS` (default 10). Only the fast news sources run every tick;
 everything else self-throttles: SEC ≥60 s per form, Form 4 job every 30 s (≤`INSIDER_MAX_FETCH`
 XML fetches, all sec.gov ≤1 req/s), halts 20 s, unusual volume 120 s, social 600 s, recap and
 earnings-calendar checks 60 s, Yahoo price cache 60 s, float/short cache 24 h (in state).
@@ -132,6 +132,21 @@ Other alerts:
 Every new source is seeded silently on its first poll (no flood). State stays bounded
 (8000 seen ids, 800 stories, 400 day items, 400 float entries, 100 latency samples; ≈50–150 KB).
 
+### Politeness / backoff (v3.1)
+- live.html every `LIVE_POLL` s (20; `LIVE_POLL_WS`=60 while the websocket is delivering), RSS every
+  `RSS_POLL` s (30), and never two stocktitan.net requests within `ST_MIN_GAP` s (5).
+- One keep-alive `requests.Session` per host, realistic browser headers, `If-None-Match` /
+  `If-Modified-Since` (both StockTitan endpoints send ETags → 304s are cheap).
+- 429/503: honour `Retry-After` (seconds or HTTP date); otherwise exponential 30→60→120→300 s.
+  A 429 from either stocktitan.net source pauses both. After a success the interval halves back
+  toward the base.
+- Wires: each has its own backoff (`WIRE_POLL` 15 s base, up to 600 s); 404/timeout are logged on
+  the first failure and every 10th after. GlobeNewswire off by default (`WIRE_GNW=0`).
+- All news requests use `NEWS_TIMEOUT` (5 s). Yahoo/QuickChart 5 s, AI 4 s.
+- Websocket: every tick logs `ws <state> msgs= news= last=<type> Ns ago err=… retry Ns`; close
+  frames are logged with code and reason, connect failures with the exact exception, and the
+  first 2 raw frames are printed (≤300 chars) to verify the protocol.
+
 ### Future option: watchlist DMs
 Per-user watchlists with DMs need a real Discord bot (bot token + gateway connection, slash
 commands, DM permission). Webhooks cannot DM users, so this is not implemented. It would require a
@@ -141,7 +156,7 @@ persistent host (not a GitHub Actions loop) running e.g. discord.py, reading the
 | var | default | meaning |
 |---|---|---|
 | `DISCORD_WEBHOOK_URL` | (secret) | webhook; bot exits if empty |
-| `POLL_SECONDS` | 10 | poll interval |
+| `POLL_SECONDS` | 10 | loop tick |
 | `RUN_MINUTES` | 0 (workflow: 340) | loop duration, 0 = single pass |
 | `STOCKTITAN_FEED_URL` | stocktitan rss | feed URL |
 | `TICKERS`, `KEYWORDS`, `EXCLUDE` | empty | filters |
