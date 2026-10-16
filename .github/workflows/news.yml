@@ -21,7 +21,7 @@ jobs:
       - run: python stocktitan_discord.py
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          POLL_SECONDS: "30"
+          POLL_SECONDS: "10"   # fast feeds every 10s; slower sources self-throttle
           RUN_MINUTES: "340"
           # Filters (comma lists, empty = allow all). Example: TICKERS: "AAPL,TSLA"
           # KEYWORDS: headline must contain one; EXCLUDE: skip if headline contains one.
@@ -52,6 +52,33 @@ jobs:
           HALTS: "1"
           # Daily recap after 16:15 ET on weekdays
           RECAP: "1"
+          # --- v3 ---
+          STOCKTITAN_LIVE: "1"        # scrape stocktitan.net/news/live.html (faster than RSS)
+          STOCKTITAN_WS: "1"          # experimental StockTitan websocket push (unverified, see README)
+          WIRES: "1"                  # direct wire RSS; per-wire toggles below
+          WIRE_PRN: "1"
+          WIRE_BW: "1"
+          WIRE_GNW: "1"               # GlobeNewswire returned 403 in testing; harmless if blocked
+          WIRE_ACCESSWIRE: "1"        # needs ACCESSWIRE_RSS_URL (no public feed found)
+          ACCESSWIRE_RSS_URL: ""
+          NEWSFILTER_API_KEY: ${{ secrets.NEWSFILTER_API_KEY }}   # optional; free tier is 1h delayed
+          NEWSFILTER_POLL: "60"
+          # AI take + sentiment (optional). Without AI_API_KEY a keyword lexicon is used.
+          AI_API_KEY: ${{ secrets.AI_API_KEY }}
+          AI_MODEL: ${{ vars.AI_MODEL || 'openai/gpt-oss-20b' }}
+          AI_BASE_URL: ${{ vars.AI_BASE_URL || 'https://api.groq.com/openai/v1' }}
+          AI_PER_MIN: "20"
+          FLOAT_DATA: "1"
+          LOW_FLOAT: "20000000"
+          HIGH_SHORT: "20"
+          CHARTS: "1"
+          EARNINGS_CAL: "1"
+          WEBHOOK_EARNINGS_CAL: ${{ secrets.WEBHOOK_EARNINGS_CAL }}
+          UNUSUAL_VOLUME: "1"
+          VOL_MULT: "5"
+          WEBHOOK_VOLUME: ${{ secrets.WEBHOOK_VOLUME }}
+          SOCIAL: "1"
+          WEBHOOK_SOCIAL: ${{ secrets.WEBHOOK_SOCIAL }}
       - name: Save state
         if: always()
         run: |
