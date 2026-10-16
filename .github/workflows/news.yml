@@ -23,6 +23,13 @@ jobs:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           POLL_SECONDS: "30"
           RUN_MINUTES: "340"
+          # Filters (comma lists, empty = allow all). Example: TICKERS: "AAPL,TSLA"
+          # KEYWORDS: headline must contain one; EXCLUDE: skip if headline contains one.
+          TICKERS: ""
+          KEYWORDS: ""
+          EXCLUDE: ""
+          # Optional SEC EDGAR filings, e.g. "8-K,4". Off by default (very noisy).
+          SEC_FORMS: ""
       - name: Save state
         if: always()
         run: |
