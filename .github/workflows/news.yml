@@ -30,6 +30,28 @@ jobs:
           EXCLUDE: ""
           # Optional SEC EDGAR filings, e.g. "8-K,4". Off by default (very noisy).
           SEC_FORMS: ""
+          # Optional per-type channels: create repo secrets with these names; unset = DISCORD_WEBHOOK_URL.
+          WEBHOOK_EARNINGS: ${{ secrets.WEBHOOK_EARNINGS }}
+          WEBHOOK_FDA: ${{ secrets.WEBHOOK_FDA }}
+          WEBHOOK_OFFERINGS: ${{ secrets.WEBHOOK_OFFERINGS }}
+          WEBHOOK_MA: ${{ secrets.WEBHOOK_MA }}
+          WEBHOOK_ANALYST: ${{ secrets.WEBHOOK_ANALYST }}
+          WEBHOOK_SEC: ${{ secrets.WEBHOOK_SEC }}        # SEC filings + insider buys
+          WEBHOOK_HALTS: ${{ secrets.WEBHOOK_HALTS }}
+          WEBHOOK_RECAP: ${{ secrets.WEBHOOK_RECAP }}
+          # Price field from Yahoo (unofficial, free). Big movers (|%| >= MOVER_PCT) get 🔥;
+          # set MOVER_ROLE_ID (Discord role id) to ping that role.
+          PRICES: "1"
+          MOVER_PCT: "10"
+          MOVER_ROLE_ID: ""
+          # Insider open-market buys from SEC Form 4 (min $ value; XML fetches per cycle)
+          INSIDER_BUYS: "1"
+          INSIDER_MIN_USD: "50000"
+          INSIDER_MAX_FETCH: "8"
+          # Nasdaq Trader trading halts / resumptions
+          HALTS: "1"
+          # Daily recap after 16:15 ET on weekdays
+          RECAP: "1"
       - name: Save state
         if: always()
         run: |
