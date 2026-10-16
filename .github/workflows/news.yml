@@ -54,11 +54,17 @@ jobs:
           RECAP: "1"
           # --- v3 ---
           STOCKTITAN_LIVE: "1"        # scrape stocktitan.net/news/live.html (faster than RSS)
+          LIVE_POLL: "20"             # live.html base interval; 429 -> Retry-After / 30-300s backoff
+          LIVE_POLL_WS: "60"          # live.html interval while the websocket is delivering
+          RSS_POLL: "30"              # StockTitan RSS interval
+          ST_MIN_GAP: "5"             # min gap between any two stocktitan.net requests
+          WIRE_POLL: "15"             # per-wire interval (404/timeouts back off quietly)
+          NEWS_TIMEOUT: "5"           # per-request timeout for news sources
           STOCKTITAN_WS: "1"          # experimental StockTitan websocket push (unverified, see README)
           WIRES: "1"                  # direct wire RSS; per-wire toggles below
           WIRE_PRN: "1"
           WIRE_BW: "1"
-          WIRE_GNW: "1"               # GlobeNewswire returned 403 in testing; harmless if blocked
+          WIRE_GNW: "0"               # GlobeNewswire: 403 (Akamai) every cycle; off
           WIRE_ACCESSWIRE: "1"        # needs ACCESSWIRE_RSS_URL (no public feed found)
           ACCESSWIRE_RSS_URL: ""
           NEWSFILTER_API_KEY: ${{ secrets.NEWSFILTER_API_KEY }}   # optional; free tier is 1h delayed
