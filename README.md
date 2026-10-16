@@ -72,11 +72,76 @@ without posting, so the channel is not flooded.
   the first time it is polled (tracked in `state.seeded`), including when you enable a source
   later. The old list-format `seen.json` is migrated automatically.
 
+## v3 features (speed first)
+Main loop polls every `POLL_SECONDS` (default 10). Only the fast news sources run every tick;
+everything else self-throttles: SEC ≥60 s per form, Form 4 job every 30 s (≤`INSIDER_MAX_FETCH`
+XML fetches, all sec.gov ≤1 req/s), halts 20 s, unusual volume 120 s, social 600 s, recap and
+earnings-calendar checks 60 s, Yahoo price cache 60 s, float/short cache 24 h (in state).
+
+Sources, fastest first:
+1. **StockTitan websocket** (`STOCKTITAN_WS`, default **0 / experimental**): the live page exposes an
+   anonymous URL (`wss://ws.stocktitan.net:9011//<id>`, no token for logged-out users; frames are
+   `{"header":{"type":"news"|"ping"},"payload":…}`, reply `{"type":"pong"}`). A background thread
+   connects with exponential backoff (5 s → 5 min) and feeds a queue drained each tick. It could not be
+   verified from the dev box (outbound port 9011 blocked), so it is off by default; enable it and watch
+   the `ws …` log line. Requires `websocket-client`.
+2. **StockTitan live.html** (`STOCKTITAN_LIVE=1`): parses the `jsGlobals.newsList` JSON embedded in
+   https://www.stocktitan.net/news/live.html (~65 latest items with ticker, exchange, title, UTC time,
+   float, short %, one-line summary). Deduped with the RSS by URL. Its float/short data is reused
+   instead of calling Yahoo.
+3. **Direct wires** (`WIRES=1`; toggles `WIRE_PRN`, `WIRE_BW`, `WIRE_GNW`, `WIRE_ACCESSWIRE`):
+   PR Newswire `news-releases-list.rss` (works, 20 latest), Business Wire all-news RSS
+   (works but only a handful of items), GlobeNewswire public-companies RSS (HTTP 403 / Akamai from
+   the test box and fetch service – may or may not work from GitHub), Accesswire (no public RSS;
+   set `ACCESSWIRE_RSS_URL` if you obtain one). Only items with an exchange ticker
+   (`(NASDAQ: ABCD)`, `NYSE American:`, `OTCQB:` …) are posted; non-English Business Wire copies skipped.
+4. **StockTitan RSS** (as before; slowest).
+5. **newsfilter.io** (optional `NEWSFILTER_API_KEY` secret): polls the Query API every
+   `NEWSFILTER_POLL` s. Note: free Starter = 100 calls/day, 5 articles/request, **1-hour delay**
+   (useless for speed; free-key signup is reported broken). Real-time needs Basic ($35/mo);
+   websocket stream needs Professional ($65/mo).
+
+**Cross-source dedupe**: every story is remembered (ticker + normalized title tokens, 12 h).
+A later copy with the same ticker and token similarity ≥ 0.6 is dropped; wire-first cards say
+`⚡ via PR Newswire`. Lead times are logged into `state.latency`.
+
+Card enrichment (each step optional and failure-tolerant):
+- **AI take + sentiment**: with `AI_API_KEY` (Groq by default, `AI_BASE_URL` for any
+  OpenAI-compatible endpoint, e.g. Gemini `https://generativelanguage.googleapis.com/v1beta/openai`),
+  `AI_MODEL` default `openai/gpt-oss-20b` (Groq retired its free Llama 3.x models in Aug 2026;
+  set e.g. `meta-llama/llama-4-scout-17b-16e-instruct` if you prefer Llama), ≤20-word take,
+  4 s timeout, `AI_PER_MIN` cap. Otherwise / on failure: keyword lexicon → 🟢/🟡/🔴 only.
+- **Float & short** (`FLOAT_DATA`): Yahoo quoteSummary `defaultKeyStatistics` via cookie+crumb;
+  tags `🧊 Low float` (< `LOW_FLOAT`) and `🩳 High short` (> `HIGH_SHORT` %).
+- **Mini chart** (`CHARTS`): intraday 5m line (≤60 points, prev-close dashed) rendered by
+  QuickChart's free `/chart/create` short URL.
+- **🗣️ Trending on Reddit** tag for tickers in ApeWisdom's current top 20.
+
+Other alerts:
+- **Earnings calendar** (`EARNINGS_CAL`): weekdays 08:00–11:00 ET, once/day, Nasdaq calendar API,
+  top 20 by market cap with EPS estimates, before-open / after-close. → `WEBHOOK_EARNINGS_CAL` →
+  `WEBHOOK_EARNINGS` → main.
+- **Unusual volume** (`UNUSUAL_VOLUME`): every 2 min in regular + after-hours, Yahoo predefined
+  screeners (most_actives, day_gainers, day_losers, small_cap_gainers ≈ 250 tickers); alert when
+  volume ≥ `VOL_MULT` × 10-day average scaled by a time-of-day volume curve, price ≥ `VOL_MIN_PRICE`,
+  volume ≥ `VOL_MIN_SHARES`; once per ticker per day. → `WEBHOOK_VOLUME`.
+  (Pre-market is skipped: Yahoo's screener only has regular-session volume.)
+- **Social buzz** (`SOCIAL`): ApeWisdom every 10 min; alert when rank rose ≥ 20 places in 24 h and
+  mentions ≥ 2× the 24h-ago count and ≥ `SOCIAL_MIN_MENTIONS`; once per ticker per day. → `WEBHOOK_SOCIAL`.
+
+Every new source is seeded silently on its first poll (no flood). State stays bounded
+(8000 seen ids, 800 stories, 400 day items, 400 float entries, 100 latency samples; ≈50–150 KB).
+
+### Future option: watchlist DMs
+Per-user watchlists with DMs need a real Discord bot (bot token + gateway connection, slash
+commands, DM permission). Webhooks cannot DM users, so this is not implemented. It would require a
+persistent host (not a GitHub Actions loop) running e.g. discord.py, reading the same state.
+
 ## Env vars
 | var | default | meaning |
 |---|---|---|
 | `DISCORD_WEBHOOK_URL` | (secret) | webhook; bot exits if empty |
-| `POLL_SECONDS` | 30 | poll interval |
+| `POLL_SECONDS` | 10 | poll interval |
 | `RUN_MINUTES` | 0 (workflow: 340) | loop duration, 0 = single pass |
 | `STOCKTITAN_FEED_URL` | stocktitan rss | feed URL |
 | `TICKERS`, `KEYWORDS`, `EXCLUDE` | empty | filters |
